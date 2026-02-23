@@ -31,6 +31,7 @@ import {
 } from '@credo-ts/core'
 import {
   type AccessTokenResponse,
+  type AuthorizationServerMetadata,
   type AuthorizationErrorResponse,
   authorizationCodeGrantIdentifier,
   type CallbackContext,
@@ -56,7 +57,12 @@ import {
   Openid4vciVersion,
   parseKeyAttestationJwt,
 } from '@openid4vc/openid4vci'
-import type { OpenId4VciCredentialConfigurationSupportedWithFormats, OpenId4VciMetadata } from '../shared'
+import { joinUriParts, URL } from '@openid4vc/utils'
+import type {
+  OpenId4VciCredentialConfigurationSupportedWithFormats,
+  OpenId4VciCredentialIssuerMetadata,
+  OpenId4VciMetadata,
+} from '../shared'
 
 import { OpenId4VciCredentialFormatProfile } from '../shared'
 import { getOid4vcCallbacks } from '../shared/callbacks'
@@ -117,7 +123,14 @@ export class OpenId4VciHolderService {
     const client = this.getClient(agentContext)
 
     const credentialOfferObject = await client.resolveCredentialOffer(credentialOffer)
-    const metadata = await client.resolveIssuerMetadata(credentialOfferObject.credential_issuer)
+    const offerWithMetadata = credentialOfferObject as CredentialOfferObjectWithMetadata
+    const metadata = offerWithMetadata.credential_issuer_metadata
+      ? await this.resolveIssuerMetadataFromOffer(agentContext, {
+          credentialIssuer: credentialOfferObject.credential_issuer,
+          credentialIssuerMetadata: offerWithMetadata.credential_issuer_metadata,
+          authorizationServerMetadata: offerWithMetadata.authorization_server_metadata,
+        })
+      : await client.resolveIssuerMetadata(credentialOfferObject.credential_issuer)
     this.logger.debug('fetched credential offer and issuer metadata', { metadata, credentialOfferObject })
 
     const credentialConfigurationsSupported = getOfferedCredentials(
@@ -1541,4 +1554,108 @@ export class OpenId4VciHolderService {
       callbacks: options ? this.getCallbacks(agentContext, options) : getOid4vcCallbacks(agentContext),
     })
   }
+
+  private async resolveIssuerMetadataFromOffer(
+    agentContext: AgentContext,
+    options: {
+      credentialIssuer: string
+      credentialIssuerMetadata: OpenId4VciCredentialIssuerMetadata
+      authorizationServerMetadata?: AuthorizationServerMetadata | AuthorizationServerMetadata[]
+    }
+  ): Promise<OpenId4VciMetadata> {
+    const callbacks = this.getCallbacks(agentContext)
+    const credentialIssuerWellKnownUrls = this.getCredentialIssuerWellKnownUrls(options.credentialIssuer)
+    const authorizationServerMetadataList = Array.isArray(options.authorizationServerMetadata)
+      ? options.authorizationServerMetadata
+      : options.authorizationServerMetadata
+        ? [options.authorizationServerMetadata]
+        : []
+    const authorizationServerWellKnownUrls = authorizationServerMetadataList.map((metadata) => ({
+      metadata,
+      urls: this.getAuthorizationServerWellKnownUrls(metadata.issuer),
+    }))
+
+    const fetchWithInlineMetadata: CallbackContext['fetch'] = async (input, init) => {
+      const url = typeof input === 'string' ? input : input.url
+
+      if (credentialIssuerWellKnownUrls.has(url)) {
+        return this.createJsonResponse(options.credentialIssuerMetadata)
+      }
+
+      const authorizationServerMatch = authorizationServerWellKnownUrls.find((entry) => entry.urls.has(url))
+      if (authorizationServerMatch) {
+        return this.createJsonResponse(authorizationServerMatch.metadata)
+      }
+
+      if (!callbacks.fetch) {
+        throw new CredoError('Missing fetch callback for resolving issuer metadata.')
+      }
+
+      return callbacks.fetch(input, init)
+    }
+
+    const client = new Openid4vciClient({
+      callbacks: {
+        ...callbacks,
+        fetch: fetchWithInlineMetadata,
+      },
+    })
+
+    return await client.resolveIssuerMetadata(options.credentialIssuer)
+  }
+
+  private getCredentialIssuerWellKnownUrls(credentialIssuer: string) {
+    const parsedIssuerUrl = new URL(credentialIssuer)
+
+    return new Set([
+      joinUriParts(parsedIssuerUrl.origin, ['.well-known/openid-credential-issuer', parsedIssuerUrl.pathname]),
+      joinUriParts(credentialIssuer, ['.well-known/openid-credential-issuer']),
+    ])
+  }
+
+  private getAuthorizationServerWellKnownUrls(issuer: string) {
+    const parsedIssuerUrl = new URL(issuer)
+
+    return new Set([
+      joinUriParts(parsedIssuerUrl.origin, ['.well-known/oauth-authorization-server', parsedIssuerUrl.pathname]),
+      joinUriParts(issuer, ['.well-known/oauth-authorization-server']),
+      joinUriParts(issuer, ['.well-known/openid-configuration']),
+    ])
+  }
+
+  private createJsonResponse(body: unknown): Response {
+    const text = JSON.stringify(body)
+
+    if (typeof Response !== 'undefined') {
+      return new Response(text, {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      })
+    }
+
+    const headers = typeof Headers !== 'undefined'
+      ? new Headers({ 'Content-Type': 'application/json' })
+      : {
+          get: (name: string) => (name.toLowerCase() === 'content-type' ? 'application/json' : null),
+        }
+
+    const buildResponse = () =>
+      ({
+        ok: true,
+        status: 200,
+        headers,
+        json: async () => JSON.parse(text),
+        text: async () => text,
+        clone: () => buildResponse(),
+      }) as unknown as Response
+
+    return buildResponse()
+  }
+}
+
+type CredentialOfferObjectWithMetadata = {
+  credential_issuer_metadata?: OpenId4VciCredentialIssuerMetadata
+  authorization_server_metadata?: AuthorizationServerMetadata | AuthorizationServerMetadata[]
 }
